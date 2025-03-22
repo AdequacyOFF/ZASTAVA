@@ -284,7 +284,7 @@ class Zastava(QtWidgets.QMainWindow):
             self.handle_image_path_changed
         )
 
-        self.ui.OnOffAllRecogButton.clicked.connect( # OnOffVideoFaceRecogButton
+        self.ui.OnOffVideoFaceRecogButton.clicked.connect( # OnOffVideoFaceRecogButton
             self.toggle_video_stream_face_recognition
         )
 
@@ -391,7 +391,6 @@ class Zastava(QtWidgets.QMainWindow):
 
     # Отображение результатов face_recog
     def update_image_face_recognition(self, image):
-        logger.debug(f"update_image_face_recognition - image")
         h, w, ch = image.shape
         center_x = w // 2
         center_y = h // 2
@@ -401,7 +400,6 @@ class Zastava(QtWidgets.QMainWindow):
         x2 = center_x + box_size // 2
         y2 = center_y + box_size // 2
         cropped_image = image[y1:y2, x1:x2]
-        logger.debug(f"update_image_face_recognition - cropped_image")
         # остальной код для отображения обработанной области
         bytes_per_line = ch * box_size
         q_image = QImage(
@@ -411,7 +409,6 @@ class Zastava(QtWidgets.QMainWindow):
             bytes_per_line,
             QImage.Format_RGB888,
         )
-        logger.debug(f"update_image_face_recognition - q_image")
         pixmap = QPixmap.fromImage(q_image)
         self.ui.videoPotokFaceRecog.setPixmap(
             pixmap.scaled(
@@ -419,7 +416,6 @@ class Zastava(QtWidgets.QMainWindow):
             )
         )
         self.ui.videoPotokFaceRecog.setScaledContents(True)
-        logger.debug(f"update_image_face_recognition - end")
 
 class soundAnalyse(QtCore.QObject):
     update_text_signal = QtCore.pyqtSignal(str)
