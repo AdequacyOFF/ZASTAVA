@@ -13,6 +13,10 @@ import psycopg2
 from psycopg2 import Error
 from loguru import logger
 
+# Импорты для YAMNet
+import Yamnet.yamnet.params as yamnet_params
+import Yamnet.yamnet.yamnet as yamnet_model
+
 from UI.addUsers import Ui_AddUsersWidget as AddUsersWidget
 from UI.zastava import Ui_Zastava as ZastavaMainWindow
 
@@ -32,6 +36,7 @@ class VideoThreadFaceRecognition(QThread):
         self.ThreadActive = False
         self.known_face_encodings = []
         self.known_face_names = []
+        self.process_this_frame = True
 
     def load_face_database(self):
         """Загружает и валидирует базу лиц из папки 'people'"""
@@ -57,10 +62,10 @@ class VideoThreadFaceRecognition(QThread):
                     image_path = os.path.join(folder_path, image)
                     try:
                         face_image = face_recognition.load_image_file(image_path)
-                        face_encodings = face_recognition.face_encodings(face_image)
+                        face_encoding = face_recognition.face_encodings(face_image)
                         
-                        if face_encodings:
-                            self.known_face_encodings.append(face_encodings[0])
+                        if face_encoding:
+                            self.known_face_encodings.append(face_encoding[0])
                             self.known_face_names.append(folder)
                             logger.debug(f"Загружено лицо: {folder} ({image_path})")
                         else:
@@ -90,57 +95,68 @@ class VideoThreadFaceRecognition(QThread):
                 if not ret:
                     break
 
-                # Уменьшаем кадр для ускорения обработки
-                small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-                rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                
-                # Находим лица на кадре
-                face_locations = face_recognition.face_locations(rgb_small_frame)
-                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+                # Обрабатываем каждый второй кадр для увеличения производительности
+                if self.process_this_frame:
+                    # Уменьшаем кадр для ускорения обработки
+                    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small_frame = small_frame[:, :, ::-1]  # BGR to RGB
+                    
+                    # Находим все лица в текущем кадре видео
+                    face_locations = face_recognition.face_locations(rgb_small_frame)
+                    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-                face_names = []
-                image_path_acc = ""
-                
-                for face_encoding in face_encodings:
-                    # Если база лиц пуста, пропускаем сравнение
-                    if not self.known_face_encodings:
-                        name = "unknown"
+                    face_names = []
+                    image_path_acc = ""
+                    
+                    for face_encoding in face_encodings:
+                        # Проверяем, есть ли совпадение с известными лицами
+                        matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
+                        name = "Unknown"
                         confidence = "N/A"
-                    else:
-                        # Сравниваем с известными лицами
-                        face_distances = face_recognition.face_distance(
-                            self.known_face_encodings, face_encoding
-                        )
-                        if len(face_distances) == 0:
-                            name = "unknown"
-                            confidence = "N/A"
-                        else:
+
+                        # Если найдены совпадения, используем самое близкое
+                        if True in matches:
+                            first_match_index = matches.index(True)
+                            name = self.known_face_names[first_match_index]
+                            
+                            # Вычисляем расстояние до всех известных лиц
+                            face_distances = face_recognition.face_distance(
+                                self.known_face_encodings, face_encoding
+                            )
                             best_match_index = np.argmin(face_distances)
-                            name = self.known_face_names[best_match_index]
                             confidence = face_confidence(face_distances[best_match_index])
                             
                             # Получаем путь к фото
                             path_acc = Path("people") / name
                             if path_acc.exists():
-                                for image in path_acc.iterdir():
-                                    image_path_acc = str(path_acc / image.name)
+                                images = list(path_acc.iterdir())
+                                if images:
+                                    image_path_acc = str(images[0])
 
-                    face_names.append(f"{name} ({confidence})")
+                        face_names.append(f"{name} ({confidence})")
 
-                # Рисуем прямоугольники вокруг лиц
-                for (top, right, bottom, left), name in zip(face_locations, face_names):
-                    top *= 4  # Масштабируем обратно к исходному размеру
-                    right *= 4
-                    bottom *= 4
-                    left *= 4
-                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                    cv2.putText(frame, name, (left + 6, bottom - 6), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Отображаем результаты
+                    for (top, right, bottom, left), name in zip(face_locations, face_names):
+                        # Масштабируем координаты лица обратно к исходному размеру
+                        top *= 4
+                        right *= 4
+                        bottom *= 4
+                        left *= 4
 
-                # Отправляем кадр в интерфейс
-                self.image_data_face_recognition.emit(frame)
-                if image_path_acc:
-                    self.image_path_changed.emit(image_path_acc)
+                        # Рисуем прямоугольник вокруг лица
+                        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+
+                        # Рисуем подпись с именем
+                        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
+                        font = cv2.FONT_HERSHEY_DUPLEX
+                        cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
+
+                    # Отправляем кадр в интерфейс
+                    self.image_data_face_recognition.emit(frame)
+                    if image_path_acc:
+                        self.image_path_changed.emit(image_path_acc)
+                
+                self.process_this_frame = not self.process_this_frame
                 
         finally:
             video_capture.release()
@@ -151,7 +167,6 @@ class VideoThreadFaceRecognition(QThread):
         self.ThreadActive = False
         self.quit()
         self.wait()
-
 
 class VideoThreadAddFace(QThread):
     image_data_face = pyqtSignal(object)
@@ -186,6 +201,81 @@ class VideoThreadAddFace(QThread):
 
     def stop(self):
         """Останавливает поток"""
+        self._running = False
+        self.quit()
+        self.wait()
+
+
+class SoundAnalyzer(QThread):
+    update_text_signal = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self.yamnet = None
+        self.yamnet_classes = None
+        
+    def initialize_yamnet(self):
+        """Инициализация модели YAMNet"""
+        try:
+            self.yamnet = yamnet_model.yamnet_frames_model(yamnet_params)
+            self.yamnet.load_weights("Yamnet/yamnet/yamnet.h5")
+            self.yamnet_classes = yamnet_model.class_names("Yamnet/yamnet/yamnet_class_map.csv")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка инициализации YAMNet: {str(e)}")
+            return False
+        
+    def run(self):
+        """Анализ звукового окружения"""
+        if not self.initialize_yamnet():
+            self.update_text_signal.emit("Ошибка инициализации анализатора звука")
+            return
+            
+        self._running = True
+        frame_len = int(yamnet_params.SAMPLE_RATE * 1)  # 1 секунда аудио
+
+        p = pyaudio.PyAudio()
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=yamnet_params.SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=frame_len,
+        )
+
+        while self._running:
+            try:
+                # Чтение аудиоданных
+                data = stream.read(frame_len, exception_on_overflow=False)
+
+                # Конвертация в float
+                frame_data = librosa.util.buf_to_float(data, n_bytes=2, dtype=np.int16)
+
+                # Предсказание модели
+                scores, _ = self.yamnet.predict(np.reshape(frame_data, [1, -1]), steps=1)
+                prediction = np.mean(scores, axis=0)
+                top5_i = np.argsort(prediction)[::-1][:2]  # Топ-2 результата
+
+                # Формирование строки результата
+                result = "Текущее событие:\n" + "\n".join(
+                    f"{self.yamnet_classes[i]}: {prediction[i]*100:.1f}%"
+                    for i in top5_i
+                )
+                
+                self.update_text_signal.emit(result)
+                
+            except Exception as e:
+                logger.error(f"Ошибка анализа звука: {str(e)}")
+                continue
+
+        # Очистка ресурсов
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        
+    def stop(self):
+        """Останавливает анализ звука"""
         self._running = False
         self.quit()
         self.wait()
@@ -307,13 +397,38 @@ class Zastava(QtWidgets.QMainWindow):
         self.face_recognition_thread.image_path_changed.connect(
             self.handle_image_path_changed)
             
+        # Инициализация анализатора звука
+        self.sound_analyzer = SoundAnalyzer()
+        self.sound_analyzer.update_text_signal.connect(self.update_sound_text)
+        
         # Настройка кнопок
         self.ui.addUserButton.clicked.connect(self.open_add_user)
-        self.ui.vehicleRecognition.clicked.connect(lambda: self.ui.stackedWidgetPage.setCurrentIndex(0))
-        self.ui.faceRecognition.clicked.connect(lambda: self.ui.stackedWidgetPage.setCurrentIndex(1))
+        self.ui.vehicleRecognition.clicked.connect(self.show_page_1)
+        self.ui.faceRecognition.clicked.connect(self.show_page_2)
         self.ui.OnOffVideoFaceRecogButton.clicked.connect(self.toggle_face_recognition)
+        self.ui.OnOffAllRecogButton.clicked.connect(self.toggle_sound_analysis)
 
         self.add_user_widget = None
+        
+        # Запуск анализа звука при старте
+        self.sound_analyzer.start()
+        self.ui.OnOffAllRecogButton.setText("Выключить анализ звука")
+
+    def toggle_sound_analysis(self):
+        """Включает/выключает анализ звука"""
+        if self.sound_analyzer.isRunning():
+            logger.debug("Останавливаю анализ звука")
+            self.sound_analyzer.stop()
+            self.ui.OnOffAllRecogButton.setText("Включить анализ звука")
+            self.ui.YamnetTextBox.setText("Анализ звука выключен")
+        else:
+            logger.debug("Запускаю анализ звука")
+            self.sound_analyzer.start()
+            self.ui.OnOffAllRecogButton.setText("Выключить анализ звука")
+
+    def update_sound_text(self, text):
+        """Обновляет текст с результатами анализа звука"""
+        self.ui.YamnetTextBox.setText(text)
 
     def toggle_face_recognition(self):
         """Включает/выключает распознавание лиц"""
@@ -321,6 +436,7 @@ class Zastava(QtWidgets.QMainWindow):
             logger.debug("Останавливаю распознавание лиц")
             self.face_recognition_thread.stop()
             self.ui.OnOffVideoFaceRecogButton.setText("Включить распознавание")
+            self.ui.videoPotokFaceRecog.clear()
         else:
             logger.debug("Запускаю распознавание лиц")
             self.face_recognition_thread.start()
@@ -376,6 +492,26 @@ class Zastava(QtWidgets.QMainWindow):
                 cursor.close()
                 conn.close()
 
+    def show_page_1(self):
+        """Переключает на страницу обнаружения объектов"""
+        self.ui.stackedWidgetPage.setCurrentIndex(0)
+        self.ui.vehicleRecognition.setStyleSheet(
+            "QPushButton{background-color: rgb(46, 46, 46); color: #ffffff; border-radius: 7px; font: bold 14px;}"
+        )
+        self.ui.faceRecognition.setStyleSheet(
+            "QPushButton{background-color: rgb(35, 35, 35); color: #ffffff; border-radius: 7px; font: bold 14px;}"
+        )
+
+    def show_page_2(self):
+        """Переключает на страницу контроля доступа"""
+        self.ui.stackedWidgetPage.setCurrentIndex(1)
+        self.ui.vehicleRecognition.setStyleSheet(
+            "QPushButton{background-color: rgb(35, 35, 35); color: #ffffff; border-radius: 7px; font: bold 14px;}"
+        )
+        self.ui.faceRecognition.setStyleSheet(
+            "QPushButton{background-color: rgb(46, 46, 46); color: #ffffff; border-radius: 7px; font: bold 14px;}"
+        )
+
     def open_add_user(self):
         """Открывает окно добавления пользователя"""
         if self.add_user_widget is None:
@@ -386,6 +522,8 @@ class Zastava(QtWidgets.QMainWindow):
         """Останавливает все потоки при закрытии приложения"""
         if self.face_recognition_thread.isRunning():
             self.face_recognition_thread.stop()
+        if self.sound_analyzer.isRunning():
+            self.sound_analyzer.stop()
         event.accept()
 
 
