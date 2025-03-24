@@ -1,236 +1,420 @@
 import sys
 import cv2
 import os
-
 import math
 import threading
 import pyaudio
 import librosa
 import numpy as np
-import matplotlib.pyplot as plt
-import keras
 import face_recognition
 import time
 from pathlib import Path
 import psycopg2
 from psycopg2 import Error
-
-import Yamnet.yamnet.params as params
-import Yamnet.yamnet.yamnet as yamnet_model
 from loguru import logger
 
 from UI.addUsers import Ui_AddUsersWidget as AddUsersWidget
 from UI.zastava import Ui_Zastava as ZastavaMainWindow
 
-from PyQt5 import QtGui
-
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtGui, QtCore, QtWidgets
 from PyQt5.QtWidgets import QWidget
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
 
-# класс для распознавания лиц с потока
 class VideoThreadFaceRecognition(QThread):
     image_data_face_recognition = pyqtSignal(object)
     image_path_changed = pyqtSignal(str)
 
     def __init__(self, zastava_instance):
-        super(VideoThreadFaceRecognition, self).__init__()
+        super().__init__()
         self.zastava = zastava_instance
-        self.unknown_face_detected = False
+        self.ThreadActive = False
+        self.known_face_encodings = []
+        self.known_face_names = []
 
-    def face_recognition_run(self):
-        self.ThreadActive = True
-        # Загрузка базы данных лиц
-        face_locations = []
-        face_encodings = []
-        face_names = []
-        known_face_encodings = []
-        known_face_names = []
-        consecutive_detections = 0
+    def load_face_database(self):
+        """Загружает и валидирует базу лиц из папки 'people'"""
+        self.known_face_encodings = []
+        self.known_face_names = []
+        
+        if not os.path.exists("people"):
+            os.makedirs("people")
+            logger.warning("Папка 'people' не найдена, создана новая")
+            return
+
         people_folders = os.listdir("people")
+        if not people_folders:
+            logger.warning("В папке 'people' нет данных о лицах")
+            return
 
+        invalid_images = []
+        
         for folder in people_folders:
             folder_path = os.path.join("people", folder)
             if os.path.isdir(folder_path):
                 for image in os.listdir(folder_path):
                     image_path = os.path.join(folder_path, image)
-                    face_image = face_recognition.load_image_file(image_path)
-                    face_encoding = face_recognition.face_encodings(face_image)[0]
+                    try:
+                        face_image = face_recognition.load_image_file(image_path)
+                        face_encodings = face_recognition.face_encodings(face_image)
+                        
+                        if face_encodings:
+                            self.known_face_encodings.append(face_encodings[0])
+                            self.known_face_names.append(folder)
+                            logger.debug(f"Загружено лицо: {folder} ({image_path})")
+                        else:
+                            invalid_images.append(image_path)
+                            logger.warning(f"Не найдено лиц на изображении: {image_path}")
+                            
+                    except Exception as e:
+                        logger.error(f"Ошибка загрузки {image_path}: {str(e)}")
+                        invalid_images.append(image_path)
 
-                    known_face_encodings.append(face_encoding)
-                    known_face_names.append(folder)
-                    logger.debug(folder)
-                    logger.debug(image_path)
+        if invalid_images:
+            logger.warning(f"Найдено {len(invalid_images)} изображений без распознаваемых лиц")
 
-        video_capture_face_recognition = cv2.VideoCapture(0)
-        while self.ThreadActive:
-            ret, frame = video_capture_face_recognition.read()
+    def run(self):
+        """Основной цикл распознавания лиц"""
+        self.ThreadActive = True
+        self.load_face_database()
+        
+        video_capture = cv2.VideoCapture(0)
+        if not video_capture.isOpened():
+            logger.error("Не удалось открыть камеру")
+            return
 
-            if ret:
-                small_frame = cv2.resize(frame, (330, 330), fx=0.25, fy=0.25)
+        try:
+            while self.ThreadActive:
+                ret, frame = video_capture.read()
+                if not ret:
+                    break
+
+                # Уменьшаем кадр для ускорения обработки
+                small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                
+                # Находим лица на кадре
                 face_locations = face_recognition.face_locations(rgb_small_frame)
-                face_encodings = face_recognition.face_encodings(
-                    rgb_small_frame, face_locations
-                )
-
-                if len(face_encodings) > 0:
-                    consecutive_detections += 1
-                else:
-                    consecutive_detections = 0
-                if consecutive_detections >= 10:
-                    logger.error("ДОСТУП РАЗРЕШЕН") # Отправляем сигнал например к воротам
+                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
                 face_names = []
-                image_path_acc = ""  # Переменная для хранения пути к фотографии
+                image_path_acc = ""
+                
                 for face_encoding in face_encodings:
-                    matches = face_recognition.compare_faces(
-                        known_face_encodings, face_encoding
-                    )
-                    name = "unknown"
-                    confidence = "unknown"
-
-                    face_distances = face_recognition.face_distance(
-                        known_face_encodings, face_encoding
-                    )
-                    best_match_index = np.argmin(face_distances)
-
-                    if matches[best_match_index]:
-                        name = known_face_names[best_match_index]
-                        confidence = face_confidence(face_distances[best_match_index])
-
-                        # Получите имя первого человека и уверенность
-                        logger.debug(name)
-                        logger.debug(confidence)
-
-                        # Сохраните путь к фотографии
-                        path_acc = Path.cwd().joinpath("people").joinpath(name)
-                        for image in path_acc.iterdir():
-                            image_path_acc = "people" + "\\" + name + "\\" + image.name
+                    # Если база лиц пуста, пропускаем сравнение
+                    if not self.known_face_encodings:
+                        name = "unknown"
+                        confidence = "N/A"
+                    else:
+                        # Сравниваем с известными лицами
+                        face_distances = face_recognition.face_distance(
+                            self.known_face_encodings, face_encoding
+                        )
+                        if len(face_distances) == 0:
+                            name = "unknown"
+                            confidence = "N/A"
+                        else:
+                            best_match_index = np.argmin(face_distances)
+                            name = self.known_face_names[best_match_index]
+                            confidence = face_confidence(face_distances[best_match_index])
+                            
+                            # Получаем путь к фото
+                            path_acc = Path("people") / name
+                            if path_acc.exists():
+                                for image in path_acc.iterdir():
+                                    image_path_acc = str(path_acc / image.name)
 
                     face_names.append(f"{name} ({confidence})")
 
+                # Рисуем прямоугольники вокруг лиц
                 for (top, right, bottom, left), name in zip(face_locations, face_names):
-                    top *= 1
-                    right *= 1
-                    bottom *= 1
-                    left *= 1
+                    top *= 4  # Масштабируем обратно к исходному размеру
+                    right *= 4
+                    bottom *= 4
+                    left *= 4
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(frame, name, (left + 6, bottom - 6), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                    cv2.rectangle(
-                        rgb_small_frame, (left, top), (right, bottom), (0, 255, 0), 1
-                    )
-                self.image_data_face_recognition.emit(rgb_small_frame)
-                self.image_path_changed.emit(
-                    image_path_acc
-                )  # Отправьте путь к фотографии
+                # Отправляем кадр в интерфейс
+                self.image_data_face_recognition.emit(frame)
+                if image_path_acc:
+                    self.image_path_changed.emit(image_path_acc)
+                
+        finally:
+            video_capture.release()
+            logger.debug("Поток распознавания лиц остановлен")
 
-    def face_recognition_stop(self):
+    def stop(self):
+        """Останавливает поток"""
         self.ThreadActive = False
-        self.terminate()
+        self.quit()
+        self.wait()
 
 
-# класс видеопотока в окне добавления лиц
 class VideoThreadAddFace(QThread):
     image_data_face = pyqtSignal(object)
-
-    video_capture_face_add = cv2.VideoCapture(0)
+    
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self.video_capture = None
 
     def run(self):
-        while True:
-            ret, frame = self.video_capture_face_add.read()
+        """Захват видео с камеры для добавления нового лица"""
+        self._running = True
+        self.video_capture = cv2.VideoCapture(0)
+        
+        if not self.video_capture.isOpened():
+            logger.error("Не удалось открыть камеру")
+            return
 
-            if ret:
-                rgb_image_face = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                resized_image_face = cv2.resize(rgb_image_face, (1080, 1080))
-                self.image_data_face.emit(resized_image_face)
+        try:
+            while self._running:
+                ret, frame = self.video_capture.read()
+                if not ret:
+                    break
+                
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized_image = cv2.resize(rgb_image, (1080, 1080))
+                self.image_data_face.emit(resized_image)
+        finally:
+            if self.video_capture:
+                self.video_capture.release()
+            logger.debug("Поток добавления лица остановлен")
 
-        self.video_capture_face_add.release()
+    def stop(self):
+        """Останавливает поток"""
+        self._running = False
+        self.quit()
+        self.wait()
 
-    def add_face_stop(self):
-        self.terminate()
 
-
-# Добавление юзера в БД
 class AddUserWidget(QWidget):
     def __init__(self):
         super().__init__()
-
         self.ui = AddUsersWidget()
         self.ui.setupUi(self)
+        self.video_thread = VideoThreadAddFace()
+        self.video_thread.image_data_face.connect(self.update_image)
+        
+        self.ui.SaveFotoFromWebCamButton.clicked.connect(self.toggle_video_stream)
+        self.ui.SaveFormButton.clicked.connect(self.save_user)
 
-        self.video_thread_face = VideoThreadAddFace()
-        self.video_thread_face.image_data_face.connect(self.update_image_face)
-
-        self.ui.SaveFotoFromWebCamButton.clicked.connect(self.toggle_add_face_potok)
-        self.ui.SaveFormButton.clicked.connect(self.save_people)
-
-    def update_image_face(self, image):
+    def update_image(self, image):
+        """Обновляет изображение в интерфейсе"""
         h, w, ch = image.shape
         bytes_per_line = ch * w
         q_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(q_image)
         self.ui.videoFromWebCam.setPixmap(
-            pixmap.scaled(
-                self.ui.videoFromWebCam.size(), aspectRatioMode=Qt.KeepAspectRatio
-            )
+            pixmap.scaled(self.ui.videoFromWebCam.size(), Qt.KeepAspectRatio)
         )
 
-    def start_add_face_potok(self):
-        self.video_thread_face.start()
-        logger.debug("start_add_face_potok")
-
-    def stop_add_face_potok(self):
-        self.video_thread_face.add_face_stop()
-        logger.debug("stop_add_face_potok")
-
-    def toggle_add_face_potok(self):
-        if self.video_thread_face and self.video_thread_face.isRunning():
-            logger.debug("toggle_add_face_potok - Выключаю поток добавления лиц")
-            self.stop_add_face_potok()
+    def toggle_video_stream(self):
+        """Включает/выключает видеопоток"""
+        if self.video_thread.isRunning():
+            logger.debug("Останавливаю видеопоток")
+            self.video_thread.stop()
+            self.ui.SaveFotoFromWebCamButton.setText("Включить камеру")
         else:
-            logger.debug("toggle_add_face_potok - Включаю поток добавления лиц")
-            self.start_add_face_potok()
+            logger.debug("Запускаю видеопоток")
+            self.video_thread.start()
+            self.ui.SaveFotoFromWebCamButton.setText("Выключить камеру")
 
-    def save_people(self):
-        surname = self.ui.SurnameAddText.text()
-        name = self.ui.NameAddText.text()
-        patronymic = self.ui.FathersNameAddText.text()
-        rank = self.ui.RankComboBoxAdd.currentText()
+    def save_user(self):
+        """Сохраняет нового пользователя в базу"""
+        if self.video_thread.isRunning():
+            self.video_thread.stop()
 
-        # Создаем путь к папке на основе данных ФИО
-        folder_path = os.path.join("people", f"{surname}_{name}_{patronymic}_{rank}")
+        if not self.ui.videoFromWebCam.pixmap():
+            logger.error("Нет изображения для сохранения")
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Нет изображения для сохранения")
+            return
+
+        surname = self.ui.SurnameAddText.text().strip()
+        name = self.ui.NameAddText.text().strip()
+        patronymic = self.ui.FathersNameAddText.text().strip()
+        rank = self.ui.RankComboBoxAdd.currentText().strip()
+
+        if not all([surname, name, patronymic, rank]):
+            logger.error("Не все поля заполнены")
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Заполните все поля")
+            return
+
+        folder_name = f"{surname}_{name}_{patronymic}_{rank}"
+        folder_path = os.path.join("people", folder_name)
         os.makedirs(folder_path, exist_ok=True)
 
-        # Получить текущий кадр с видеопотока
-        current_frame = self.ui.videoFromWebCam.pixmap().toImage()
-
-        # Создать имя файла на основе временной метки
-        filename = f"frame_{int(time.time())}.jpg"
-
-        # Полный путь к файлу
+        filename = f"face_{int(time.time())}.jpg"
         file_path = os.path.join(folder_path, filename)
 
-        # Сохранить кадр в файл
-        current_frame.save(file_path)
+        if not self.ui.videoFromWebCam.pixmap().save(file_path):
+            logger.error(f"Не удалось сохранить изображение: {file_path}")
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Не удалось сохранить фото")
+            return
 
-        # Вывести сообщение об успешном сохранении
-        print(f"Кадр сохранен в {file_path}")
+        try:
+            conn = psycopg2.connect(
+                host="localhost",
+                database="zastava",
+                user="postgres",
+                password="2473",
+            )
+            cursor = conn.cursor()
 
+            cursor.execute("""
+                INSERT INTO people (surname, name, patronymic, rank, photo_path)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (surname, name, patronymic, rank, file_path))
+
+            conn.commit()
+            logger.success(f"Пользователь сохранен: {surname} {name}")
+            QtWidgets.QMessageBox.information(self, "Успех", "Пользователь сохранен!")
+
+        except Error as e:
+            logger.error(f"Ошибка базы данных: {str(e)}")
+            QtWidgets.QMessageBox.critical(self, "Ошибка", f"Ошибка базы данных: {str(e)}")
+        finally:
+            if conn:
+                cursor.close()
+                conn.close()
+
+        # Очищаем форму
+        self.ui.SurnameAddText.clear()
+        self.ui.NameAddText.clear()
+        self.ui.FathersNameAddText.clear()
+        self.ui.RankComboBoxAdd.setCurrentIndex(0)
+
+    def closeEvent(self, event):
+        """Останавливает поток при закрытии окна"""
+        if self.video_thread.isRunning():
+            self.video_thread.stop()
+        event.accept()
+
+
+class Zastava(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.ui = ZastavaMainWindow()
+        self.ui.setupUi(self)
+        
+        # Инициализация потока распознавания лиц
+        self.face_recognition_thread = VideoThreadFaceRecognition(self)
+        self.face_recognition_thread.image_data_face_recognition.connect(
+            self.update_face_recognition_image)
+        self.face_recognition_thread.image_path_changed.connect(
+            self.handle_image_path_changed)
+            
+        # Настройка кнопок
+        self.ui.addUserButton.clicked.connect(self.open_add_user)
+        self.ui.vehicleRecognition.clicked.connect(lambda: self.ui.stackedWidgetPage.setCurrentIndex(0))
+        self.ui.faceRecognition.clicked.connect(lambda: self.ui.stackedWidgetPage.setCurrentIndex(1))
+        self.ui.OnOffVideoFaceRecogButton.clicked.connect(self.toggle_face_recognition)
+
+        self.add_user_widget = None
+
+    def toggle_face_recognition(self):
+        """Включает/выключает распознавание лиц"""
+        if self.face_recognition_thread.isRunning():
+            logger.debug("Останавливаю распознавание лиц")
+            self.face_recognition_thread.stop()
+            self.ui.OnOffVideoFaceRecogButton.setText("Включить распознавание")
+        else:
+            logger.debug("Запускаю распознавание лиц")
+            self.face_recognition_thread.start()
+            self.ui.OnOffVideoFaceRecogButton.setText("Выключить распознавание")
+
+    def update_face_recognition_image(self, image):
+        """Обновляет изображение с распознанными лицами"""
+        h, w, ch = image.shape
+        bytes_per_line = ch * w
+        q_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_image)
+        self.ui.videoPotokFaceRecog.setPixmap(
+            pixmap.scaled(self.ui.videoPotokFaceRecog.size(), Qt.KeepAspectRatio))
+        self.ui.videoPotokFaceRecog.setScaledContents(True)
+
+    def handle_image_path_changed(self, image_path):
+        """Обрабатывает изменение пути к изображению"""
+        self.image_path = image_path
+        self.load_user_data()
+
+    def load_user_data(self):
+        """Загружает данные пользователя из базы"""
+        try:
+            conn = psycopg2.connect(
+                host="localhost",
+                database="zastava",
+                user="postgres",
+                password="2473",
+            )
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM people WHERE photo_path = %s", (self.image_path,))
+            user_data = cursor.fetchone()
+            
+            if user_data:
+                surname, name, patronymic, rank, photo_path = user_data[1:6]
+                self.ui.historyInfoFaceRecog1.setText(
+                    f"ФИО: {surname} {name} {patronymic}\nЗвание: {rank}")
+                
+                if os.path.exists(photo_path):
+                    self.ui.historyPhotoFaceRecog1.setPixmap(QPixmap(photo_path))
+                else:
+                    logger.warning(f"Изображение не найдено: {photo_path}")
+                    self.ui.historyPhotoFaceRecog1.clear()
+            else:
+                self.ui.historyInfoFaceRecog1.setText("Неизвестное лицо")
+                self.ui.historyPhotoFaceRecog1.clear()
+                
+        except Error as e:
+            logger.error(f"Ошибка базы данных: {str(e)}")
+        finally:
+            if conn:
+                cursor.close()
+                conn.close()
+
+    def open_add_user(self):
+        """Открывает окно добавления пользователя"""
+        if self.add_user_widget is None:
+            self.add_user_widget = AddUserWidget()
+        self.add_user_widget.show()
+
+    def closeEvent(self, event):
+        """Останавливает все потоки при закрытии приложения"""
+        if self.face_recognition_thread.isRunning():
+            self.face_recognition_thread.stop()
+        event.accept()
+
+
+def face_confidence(face_distance, face_match_threshold=0.6):
+    """Рассчитывает уверенность распознавания лица в процентах"""
+    range_val = 1.0 - face_match_threshold
+    linear_val = (1.0 - face_distance) / (range_val * 2.0)
+
+    if face_distance > face_match_threshold:
+        return str(round(linear_val * 100, 2)) + "%"
+    else:
+        value = (linear_val + ((1.0 - linear_val) * math.pow((linear_val - 0.5) * 2, 0.2))) * 100
+        return str(round(value, 2)) + "%"
+
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    
+    # Создаем таблицу, если ее нет
+    try:
         conn = psycopg2.connect(
             host="localhost",
             database="zastava",
             user="postgres",
-            password="postgres",
+            password="2473",
         )
-
-        # Создание курсора
         cursor = conn.cursor()
-
-        # Создание таблицы, если она не существует
-        cursor.execute(
-            """
+        
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS people (
                 id SERIAL PRIMARY KEY,
                 surname VARCHAR(255),
@@ -239,249 +423,15 @@ class AddUserWidget(QWidget):
                 rank VARCHAR(255),
                 photo_path VARCHAR(255)
             )
-        """
-        )
-
-        # Вставка данных в таблицу
-        cursor.execute(
-            """
-            INSERT INTO people (surname, name, patronymic, rank, photo_path)
-            VALUES (%s, %s, %s, %s, %s)
-        """,
-            (surname, name, patronymic, rank, file_path),
-        )
-
-        # Выполняем запрос на выборку всех строк из таблицы people
-        cursor.execute("SELECT  *  FROM people")
-        rows = cursor.fetchall()
-        logger.debug(rows)
-
-        # Подтверждение изменений
+        """)
         conn.commit()
+    except Error as e:
+        logger.error(f"Ошибка инициализации базы данных: {str(e)}")
+    finally:
+        if conn:
+            cursor.close()
+            conn.close()
 
-        # Закрытие соединения
-        cursor.close()
-        conn.close()
-
-        self.ui.SurnameAddText.clear()
-        self.ui.NameAddText.clear()
-        self.ui.FathersNameAddText.clear()
-        self.ui.RankComboBoxAdd.clearEditText()
-
-
-# Основной графический интерфейс
-class Zastava(QtWidgets.QMainWindow):
-    def __init__(self):
-        super(Zastava, self).__init__()
-        self.ui = ZastavaMainWindow()
-        self.ui.setupUi(self)
-        self.ui.addUserButton.clicked.connect(self.open_addUser)
-        self.ui.vehicleRecognition.clicked.connect(self.show_page_1)
-        self.ui.faceRecognition.clicked.connect(self.show_page_2)
-
-        self.video_thread_face_recognition = VideoThreadFaceRecognition(self)
-        self.video_thread_face_recognition.image_path_changed.connect(
-            self.handle_image_path_changed
-        )
-
-        self.ui.OnOffVideoFaceRecogButton.clicked.connect( # OnOffVideoFaceRecogButton
-            self.toggle_video_stream_face_recognition
-        )
-
-        self.widget = None
-        # объявление класса анализа звукового окружения
-        self.soundAnalyse = soundAnalyse()
-        self.soundAnalyse.update_text_signal.connect(self.display_yamnet_result)
-
-    def update_audio(self):
-        self.soundAnalyse.process_audio()
-
-    def handle_image_path_changed(self, image_path_acc):
-        self.image_path = image_path_acc
-        self.load_user_data()
-
-    def load_user_data(self):
-        # Подключение к базе данных
-        conn = psycopg2.connect(
-            host="localhost",
-            database="zastava",
-            user="postgres",
-            password="postgres",
-        )
-        # Создание курсора для выполнения SQL-запросов
-        cursor = conn.cursor()
-
-        # Выполнение SQL-запроса для получения информации о пользователе по пути
-        cursor.execute(f"SELECT * FROM people WHERE photo_path='{self.image_path}'")
-        user_data = cursor.fetchone()
-
-        # Закрытие курсора и соединения с базой данных
-        cursor.close()
-        conn.close()
-
-        if user_data is not None:
-            surname = user_data[1]
-            name = user_data[2]
-            patronymic = user_data[3]
-            rank = user_data[4]
-            photo_path = user_data[5]
-
-            # Загрузка фотографии
-            photo = QtGui.QPixmap(photo_path)
-
-            # Вывод данных о пользователе и фотографии в соответствующие виджеты
-            self.ui.historyInfoFaceRecog1.setText(
-                f"ФИО: {surname} {name} {patronymic}\nЗвание: {rank}"
-            )
-            self.ui.historyPhotoFaceRecog1.setPixmap(photo)
-
-            # Обновление последнего распознанного человека в формах label
-            self.last_recognized_person = {
-                "surname": surname,
-                "name": name,
-                "patronymic": patronymic,
-                "rank": rank,
-                "photo": photo,
-            }
-        else:
-            self.ui.historyInfoFaceRecog1.setText("Неизвестное лицо")
-            self.ui.historyPhotoFaceRecog1.setPixmap(QtGui.QPixmap())
-
-    def show_page_1(self):
-        self.ui.stackedWidgetPage.setCurrentIndex(0)
-
-    def show_page_2(self):
-        self.ui.stackedWidgetPage.setCurrentIndex(1)
-
-    def start_face_recognition_thread(self):
-        self.video_thread_face_recognition.moveToThread(
-            self.video_thread_face_recognition
-        )
-        self.video_thread_face_recognition.started.connect(
-            self.video_thread_face_recognition.face_recognition_run
-        )
-        self.video_thread_face_recognition.image_data_face_recognition.connect(
-            self.update_image_face_recognition
-        )
-        logger.debug("Видеопоток распознавания лиц включен")
-        logger.debug(self.video_thread_face_recognition.start())
-
-    def toggle_video_stream_face_recognition(self):
-        if (
-            self.video_thread_face_recognition
-            and self.video_thread_face_recognition.isRunning()
-        ):
-            logger.debug("Выключаю распознавание лиц")
-            self.stop_face_recognition_thread()
-        else:
-            self.start_face_recognition_thread()
-
-    def stop_face_recognition_thread(self):
-        self.video_thread_face_recognition.face_recognition_stop()
-
-    # Открытие виджета добавления пользователя
-    def open_addUser(self):
-        if self.widget is None:
-            self.widget = AddUserWidget()
-        self.widget.show()
-
-    # Отображение результата работы yamnet
-    def display_yamnet_result(self, result):
-        self.ui.YamnetTextBox.setText(result)
-
-    # Отображение результатов face_recog
-    def update_image_face_recognition(self, image):
-        h, w, ch = image.shape
-        center_x = w // 2
-        center_y = h // 2
-        box_size = 200
-        x1 = center_x - box_size // 2
-        y1 = center_y - box_size // 2
-        x2 = center_x + box_size // 2
-        y2 = center_y + box_size // 2
-        cropped_image = image[y1:y2, x1:x2]
-        # остальной код для отображения обработанной области
-        bytes_per_line = ch * box_size
-        q_image = QImage(
-            bytes(cropped_image.data),
-            box_size,
-            box_size,
-            bytes_per_line,
-            QImage.Format_RGB888,
-        )
-        pixmap = QPixmap.fromImage(q_image)
-        self.ui.videoPotokFaceRecog.setPixmap(
-            pixmap.scaled(
-                self.ui.videoPotokFaceRecog.size(), aspectRatioMode=Qt.KeepAspectRatio
-            )
-        )
-        self.ui.videoPotokFaceRecog.setScaledContents(True)
-
-class soundAnalyse(QtCore.QObject):
-    update_text_signal = QtCore.pyqtSignal(str)
-
-    def process_audio(self):
-        yamnet = yamnet_model.yamnet_frames_model(params)
-        yamnet.load_weights("Yamnet/yamnet/yamnet.h5")
-        yamnet_classes = yamnet_model.class_names("Yamnet/yamnet/yamnet_class_map.csv")
-
-        frame_len = int(params.SAMPLE_RATE * 1)  # 1sec
-
-        p = pyaudio.PyAudio()
-        stream = p.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=params.SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=frame_len,
-        )
-
-        while True:
-            # data read
-            data = stream.read(frame_len, exception_on_overflow=False)
-
-            # byte --> float
-            frame_data = librosa.util.buf_to_float(data, n_bytes=2, dtype=np.int16)
-
-            # model prediction
-            scores, melspec = yamnet.predict(np.reshape(frame_data, [1, -1]), steps=1)
-            prediction = np.mean(scores, axis=0)
-
-            top5_i = np.argsort(prediction)[::-1][:2]
-
-            # append result to list
-            result = "Текущее событие:\n" + "".join(
-                " {:12s}: {:.3f}".format(yamnet_classes[i], prediction[i])
-                for i in top5_i
-            )
-            self.update_text_signal.emit(result)
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-
-
-if __name__ == "__main__":
-    app = QtWidgets.QApplication(sys.argv)
-
-    application = Zastava()
-
-    # создание потока звукоанализа
-    yamnet_thread = threading.Thread(target=application.update_audio)
-    yamnet_thread.start()
-
-    def face_confidence(face_distance, face_match_threshold=0.6):
-        range = 1.0 - face_match_threshold
-        linear_val = (1.0 - face_distance) / (range * 2.0)
-
-        if face_distance > face_match_threshold:
-            return str(round(linear_val * 100, 2)) + "%"
-        else:
-            value = (
-                linear_val
-                + ((1.0 - linear_val) * math.pow((linear_val - 0.5) * 2, 0.2))
-            ) * 100
-            return str(round(value, 2)) + "%"
-
-    application.show()
-
+    window = Zastava()
+    window.show()
     sys.exit(app.exec_())
