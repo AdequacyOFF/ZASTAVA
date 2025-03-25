@@ -2,14 +2,17 @@ import psycopg2
 from loguru import logger
 from psycopg2 import connect
 
-
+from dotenv import dotenv_values
 class DB:
     def __init__(self):
-        self.host = 'DB_HOST'
-        self.port = 'DB_PORT'
-        self.database = 'DB_NAME'
-        self.user = 'DB_USER'
-        self.password = 'DB_PWD'
+        config = dotenv_values(".env")
+        if not config:
+            raise ValueError("Не найден файл .env")
+        self.host: str = config['DB_HOST']
+        self.port: int = int(config['DB_PORT'])
+        self.database: str = config['DB_DATABASE']
+        self.user: str = config['DB_USER']
+        self.password: str = config['DB_PWD']
         self.conn = psycopg2.connect(
             host=self.host, user=self.user, password=self.password, database=self.database, port=self.port
         )
@@ -28,6 +31,7 @@ class DB:
             )
         """
         )
+        self.conn.commit()
 
     def __del__(self):
         self.cursor.close()
@@ -36,7 +40,7 @@ class DB:
     # Выполнение SQL-запроса для получения информации о пользователе по пути
     def get_user_by_image_path(self, image_path: str) -> tuple | None:
 
-        self.cursor.execute(f"SELECT * FROM people WHERE photo_path='{self.image_path}'")
+        self.cursor.execute(f"SELECT * FROM people WHERE photo_path='{image_path}'")
         user_data = self.cursor.fetchone()
         return user_data
 

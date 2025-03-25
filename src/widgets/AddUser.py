@@ -8,13 +8,14 @@ import time
 
 from src.threads.AddFaceVideo import VideoThreadAddFace
 from src.ui.addUsers import Ui_AddUsersWidget as AddUsersWidget
-from src.db.Connect import DB
+from src.utils.ThreadClose import end_thread
 
 
 # Добавление юзера в БД
 class AddUserWidget(QWidget):
-    def __init__(self):
+    def __init__(self, database):
         super().__init__()
+        self.database = database
 
         self.ui = AddUsersWidget()
         self.ui.setupUi(self)
@@ -24,6 +25,13 @@ class AddUserWidget(QWidget):
 
         self.ui.SaveFotoFromWebCamButton.clicked.connect(self.toggle_add_face_thread)
         self.ui.SaveFormButton.clicked.connect(self.save_people)
+
+    def closeEvent(self, event) -> None:
+        # Завершение работы потока, если он активен
+        end_thread(self.video_thread_face)
+        self.close()
+        logger.debug("Все процессы завершены.")
+        event.accept()  # Подтверждаем закрытие
 
     def update_image_face(self, image):
         h, w, ch = image.shape
@@ -42,6 +50,7 @@ class AddUserWidget(QWidget):
 
     def stop_add_face_thread(self):
         self.video_thread_face.add_face_stop()
+        self.close()
         logger.debug("stop_add_face_potok")
 
     def toggle_add_face_thread(self):
@@ -59,7 +68,7 @@ class AddUserWidget(QWidget):
         rank = self.ui.RankComboBoxAdd.currentText()
 
         # Создаем путь к папке на основе данных ФИО
-        folder_path = os.path.join("../people", f"{surname}_{name}_{patronymic}_{rank}")
+        folder_path = os.path.join("people", f"{surname}_{name}_{patronymic}_{rank}")
         os.makedirs(folder_path, exist_ok=True)
 
         # Получить текущий кадр с видеопотока
@@ -72,16 +81,20 @@ class AddUserWidget(QWidget):
         file_path = os.path.join(folder_path, filename)
 
         # Сохранить кадр в файл
-        current_frame.save(file_path)
+        if current_frame.save(file_path):
+            # Вывести сообщение об успешном сохранении
+            print(f"Кадр сохранен в {file_path}")
+        else:
+            raise Exception("Ошибка при сохранении пользователя")
 
-        # Вывести сообщение об успешном сохранении
-        print(f"Кадр сохранен в {file_path}")
-
+        self.database.add_user(surname, name, patronymic, rank, file_path)
         # Выполняем запрос на выборку всех строк из таблицы people
-        rows = DB.get_all_users()
+        rows = self.database.get_all_users()
         logger.debug(rows)
 
         self.ui.SurnameAddText.clear()
         self.ui.NameAddText.clear()
         self.ui.FathersNameAddText.clear()
         self.ui.RankComboBoxAdd.clearEditText()
+
+        self.stop_add_face_thread()

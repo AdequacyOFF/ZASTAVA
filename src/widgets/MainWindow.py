@@ -6,14 +6,18 @@ from src.ui.zastava import Ui_Zastava as MainUI
 from src.threads.FaceRecog import VideoThreadFaceRecognition
 from src.widgets.AddUser import AddUserWidget
 from src.objects.Sound import SoundAnalyse
-from src.db.Connect import DB
+from src.utils.ThreadClose import end_thread
 
 from loguru import logger
 
+
 # Основной графический интерфейс
 class Zastava(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, database):
         super(Zastava, self).__init__()
+
+        self.db = database
+
         self.ui = MainUI()
         self.ui.setupUi(self)
         self.ui.addUserButton.clicked.connect(self.open_addUser)
@@ -21,6 +25,7 @@ class Zastava(QtWidgets.QMainWindow):
         self.ui.faceRecognition.clicked.connect(self.show_page_2)
 
         self.video_thread_face_recognition = VideoThreadFaceRecognition()
+
         self.video_thread_face_recognition.image_path_changed.connect(
             self.handle_image_path_changed
         )
@@ -34,6 +39,14 @@ class Zastava(QtWidgets.QMainWindow):
         self.soundAnalyse = SoundAnalyse()
         self.soundAnalyse.update_text_signal.connect(self.display_yamnet_result)
 
+    def closeEvent(self, event) -> None:
+        # Завершение работы потока, если он активен
+        end_thread(self.video_thread_face_recognition)
+        self.db.__del__()
+        self.parent().close()
+        logger.debug("Все процессы завершены.")
+        event.accept()  # Подтверждаем закрытие
+
     def update_audio(self):
         self.soundAnalyse.process_audio()
 
@@ -41,9 +54,39 @@ class Zastava(QtWidgets.QMainWindow):
         self.image_path = image_path_acc
         self.load_user_data()
 
+    def load_vehicle_data(self):
+
+        vehicle_data = self.db.get_vehicle_by_image_path(image_path=self.image_path)
+
+        if vehicle_data is not None:
+            label = vehicle_data[1]
+            brand = vehicle_data[2]
+            color = vehicle_data[3]
+
+            # Загрузка фотографии
+            photo = QPixmap(photo_path)
+
+            # Вывод данных о пользователе и фотографии в соответствующие виджеты
+            self.ui.historyInfoVehicleRecog1.setText(
+                f"Марка и цвет: {brand} {color} \nНомер: {label}"
+            )
+            self.ui.historyPhotoVehicleRecog1.setPixmap(photo)
+
+            # Обновление последнего распознанного человека в формах label
+            self.last_recognized_person = {
+                "surname": surname,
+                "name": name,
+                "patronymic": patronymic,
+                "rank": rank,
+                "photo": photo,
+            }
+        else:
+            self.ui.historyInfoFaceRecog1.setText("Неизвестное лицо")
+            self.ui.historyPhotoFaceRecog1.setPixmap(QPixmap())
+
     def load_user_data(self):
 
-        user_data = DB.get_user_by_image_path(image_path=self.image_path)
+        user_data = self.db.get_user_by_image_path(image_path=self.image_path)
 
         if user_data is not None:
             surname = user_data[1]
@@ -75,6 +118,7 @@ class Zastava(QtWidgets.QMainWindow):
 
     def show_page_1(self):
         self.ui.stackedWidgetPage.setCurrentIndex(0)
+        self.toggle_video_stream_face_recognition()
 
     def show_page_2(self):
         self.ui.stackedWidgetPage.setCurrentIndex(1)
@@ -108,7 +152,7 @@ class Zastava(QtWidgets.QMainWindow):
     # Открытие виджета добавления пользователя
     def open_addUser(self):
         if self.widget is None:
-            self.widget = AddUserWidget()
+            self.widget = AddUserWidget(self.db)
         self.widget.show()
 
     # Отображение результата работы yamnet

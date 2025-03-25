@@ -591,11 +591,11 @@ class Ui_Zastava(object):
     def retranslateUi(self, Zastava):
         _translate = QtCore.QCoreApplication.translate
         Zastava.setWindowTitle(_translate("Zastava", "MainWindow"))
-        self.vehicleRecognition.setText(_translate("Zastava", "Обнаружение объектов"))
+        self.vehicleRecognition.setText(_translate("Zastava", "Допуск ТС"))
         self.faceRecognition.setText(_translate("Zastava", "Контроль доступа"))
         self.videoTitleAllRecog.setText(_translate("Zastava", "Видеопоток"))
         self.OnOffAllRecogButton.setText(
-            _translate("Zastava", "МОЯ КНОПКА") #Включить / выключить видеопоток
+            _translate("Zastava", "Включить / выключить видеопоток") #Включить / выключить видеопоток
         )
         self.soundTitle.setText(_translate("Zastava", "Анализ звукового окружения"))
         self.YamnetTextBox.setHtml(

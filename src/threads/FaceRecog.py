@@ -26,18 +26,40 @@ class VideoThreadFaceRecognition(QThread):
         known_face_encodings = []
         known_face_names = []
         consecutive_detections = 0
-        people_folders = os.listdir("../../people")
-
+        people_folders = os.listdir("people")
+        if not people_folders:
+            logger.warning("No registered people found")
+            raise FileNotFoundError
         for folder in people_folders:
-            folder_path = os.path.join("../../people", folder)
+            folder_path = os.path.join("people", folder)
             if os.path.isdir(folder_path):
                 for image in os.listdir(folder_path):
                     image_path = os.path.join(folder_path, image)
-                    face_image = face_recognition.load_image_file(image_path)
-                    face_encoding = face_recognition.face_encodings(face_image)[0]
+                    try:
+                        # Загрузка и проверка изображения
+                        face_image = face_recognition.load_image_file(image_path)
+                        if face_image.size == 0:
+                            logger.warning(f"Пустое изображение: {image_path}")
+                            continue
 
-                    known_face_encodings.append(face_encoding)
-                    known_face_names.append(folder)
+                        # Поиск лиц перед кодированием
+                        face_locs = face_recognition.face_locations(face_image)
+                        if not face_locs:
+                            logger.warning(f"Лицо не найдено: {image_path}")
+                            continue
+
+                        # Получение энкодингов
+                        encodings = face_recognition.face_encodings(face_image, face_locs)
+                        if not encodings:
+                            logger.warning(f"Не удалось получить энкодинг: {image_path}")
+                            continue
+
+                        known_face_encodings.append(encodings[0])
+                        known_face_names.append(folder)
+                        logger.success(f"Успешно обработано: {image_path}")
+
+                    except Exception as e:
+                        logger.error(f"Ошибка в файле {image_path}: {e}")
                     logger.debug(folder)
                     logger.debug(image_path)
 
@@ -74,6 +96,8 @@ class VideoThreadFaceRecognition(QThread):
                     )
                     best_match_index = np.argmin(face_distances)
 
+
+
                     if matches[best_match_index]:
                         name = known_face_names[best_match_index]
                         confidence = face_confidence(face_distances[best_match_index])
@@ -83,7 +107,7 @@ class VideoThreadFaceRecognition(QThread):
                         logger.debug(confidence)
 
                         # Сохраните путь к фотографии
-                        path_acc = Path.cwd().joinpath("../../people").joinpath(name)
+                        path_acc = Path.cwd().joinpath("people").joinpath(name)
                         for image in path_acc.iterdir():
                             image_path_acc = "people" + "\\" + name + "\\" + image.name
 
